@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 type AccessTokenResponse struct {
@@ -38,6 +40,11 @@ func (o Config) IsValid() (bool, error) {
 	return true, nil
 }
 
+var (
+	ErrRefreshTokenNeeded = errors.New("refresh token is needed")
+	ErrRefreshTokenFail   = errors.New("refresh token fail")
+)
+
 type SellingPartner struct {
 	cfg               *Config
 	accessToken       string
@@ -56,10 +63,63 @@ func NewSellingPartner(cfg *Config) (*SellingPartner, error) {
 }
 
 func (s *SellingPartner) RefreshToken() error {
+	// refresh token needed
+	if s.cfg.RefreshToken == "" {
+		return ErrRefreshTokenNeeded
+	}
 
 	reqBody, _ := json.Marshal(map[string]string{
 		"grant_type":    "refresh_token",
 		"refresh_token": s.cfg.RefreshToken,
+		"client_id":     s.cfg.ClientID,
+		"client_secret": s.cfg.ClientSecret,
+	})
+
+	resp, err := http.Post(
+		"https://api.amazon.com/auth/o2/token",
+		"application/json",
+		bytes.NewBuffer(reqBody))
+
+	if err != nil {
+		return err
+	}
+
+	defer func(Body io.ReadCloser) {
+		_ = Body.Close()
+	}(resp.Body)
+
+	respBodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	theResp := &AccessTokenResponse{}
+
+	if err = json.Unmarshal(respBodyBytes, theResp); err != nil {
+		log.Errorf("RefreshToken response parse failed. Body: ", string(respBodyBytes))
+		return err
+	}
+
+	if theResp.AccessToken != "" {
+		s.accessToken = theResp.AccessToken
+		s.accessTokenExpiry = time.Now().UTC().Add(time.Duration(theResp.ExpiresIn) * time.Second) //set expiration time
+		return nil
+	}
+
+	if theResp.Error != "" {
+		log.Errorf("RefreshToken failed with code %s, description %s", theResp.Error, theResp.ErrorDescription)
+		return errors.New(theResp.Error)
+	}
+
+	log.Errorf("RefreshToken failed with unknown reason. Body: %s", string(respBodyBytes))
+	return ErrRefreshTokenFail
+}
+
+func (s *SellingPartner) OAuth2(code string) error {
+
+	reqBody, _ := json.Marshal(map[string]string{
+		"grant_type":    "authorization_code",
+		"code":          code,
 		"client_id":     s.cfg.ClientID,
 		"client_secret": s.cfg.ClientSecret,
 	})
